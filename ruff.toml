@@ -1,0 +1,5 @@
+# Config ruff pour la CI.
+# E741 ignoré : quelques variables courtes (l, f, …) dans des boucles de parsing,
+# lisibilité non impactée. Le reste des règles par défaut (E4/E7/E9/F) s'applique.
+[lint]
+ignore = ["E741"]

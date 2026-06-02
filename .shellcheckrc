@@ -1,0 +1,3 @@
+# SC2088 : les '~' dans nos messages d'affichage (printf/echo) sont volontairement
+# littéraux — ce sont des libellés affichés à l'utilisateur, pas des chemins à étendre.
+disable=SC2088

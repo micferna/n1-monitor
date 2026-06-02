@@ -1,0 +1,4 @@
+# Permissions ciblées pour le widget n1-monitor (toggles firewall + Mullvad).
+# Installé en /etc/sudoers.d/n1-monitor (chmod 440) par scripts/n1-setup.sh.
+# Remplace USERNAME par ton utilisateur. Aucune autre commande n'est NOPASSWD.
+USERNAME ALL=(root) NOPASSWD: /usr/sbin/nft -f /etc/nftables-hardening.conf, /usr/sbin/nft delete table inet hardening, /usr/bin/mullvad lockdown-mode set on, /usr/bin/mullvad lockdown-mode set off

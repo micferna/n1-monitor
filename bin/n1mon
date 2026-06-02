@@ -1,0 +1,5 @@
+#!/bin/sh
+# Wrapper de lancement du TUI. Lancé en tant qu'utilisateur → $HOME résout seul.
+# (scripts/n1-setup.sh installe ce fichier dans /usr/local/bin/n1mon)
+N1MON_DIR="$HOME/.local/share/n1-monitor"
+exec "$N1MON_DIR/.venv/bin/python" "$N1MON_DIR/tui.py" "$@"

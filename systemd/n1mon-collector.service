@@ -1,0 +1,28 @@
+[Unit]
+Description=n1 monitor — collecteur firewall/réseau/VPN
+After=nftables-hardening.service network-online.target
+Wants=nftables-hardening.service
+
+[Service]
+Type=simple
+# Remplace 'youruser' par ton utilisateur. scripts/n1-setup.sh écrit le bon
+# chemin automatiquement (USER_NAME détecté via $SUDO_USER).
+ExecStart=/usr/bin/python3 /home/youruser/.local/share/n1-monitor/collector.py --interval 2
+Restart=on-failure
+RestartSec=3
+# Hardening modéré (le service a besoin d'accéder à nft, journal kernel, ss --processes)
+NoNewPrivileges=true
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/run
+# Journal de présence infra persistant (crée /var/lib/n1-monitor, root:root)
+StateDirectory=n1-monitor
+PrivateTmp=true
+LockPersonality=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+MemoryMax=128M
+CPUQuota=15%
+
+[Install]
+WantedBy=multi-user.target

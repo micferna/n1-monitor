@@ -1,0 +1,14 @@
+# Inventaire réel (IP/rôles de l'infra) — JAMAIS commité, voir hosts.example.json
+hosts.json
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Runtime / état (générés par le collector)
+/run/
+n1-monitor.json
+presence.jsonl
+*.log

@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint (Python · Shell · JSON)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Ruff — lint Python
+        run: ruff check collector.py tui.py
+
+      - name: Byte-compile Python (pas de dépendances requises)
+        run: python -m py_compile collector.py tui.py
+
+      - name: ShellCheck — scripts shell
+        run: shellcheck -S warning scripts/*.sh bin/n1mon
+
+      - name: Valider les JSON
+        run: |
+          jq empty hosts.example.json
+          jq empty gnome-extension/metadata.json

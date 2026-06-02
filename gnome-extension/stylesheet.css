@@ -1,0 +1,9 @@
+.n1mon-label {
+    font-family: monospace;
+    font-weight: bold;
+    padding: 0 4px;
+}
+
+.n1mon-alert {
+    color: #ff5555;
+}

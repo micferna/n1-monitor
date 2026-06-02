@@ -1,0 +1,18 @@
+{
+  "_comment": "Inventaire infra pour le panneau n1mon. Copie ce fichier en 'hosts.json' et adapte. 'role' = ce qui tourne dessus ; 'probe.port' = port TCP sondé (connecté OU refused/RST = UP, timeout → fallback ping, EHOSTUNREACH = unreachable) ; 'alert' = lève ntfy+desktop sur transition. Les VMs 'tunnel-vm' non routées depuis l'hôte → alert:false pour éviter le bruit. IP ici = plages de documentation (RFC5737 / RFC1918), à remplacer.",
+  "ntfy": {
+    "enabled": false,
+    "url": "http://ntfy.example.local",
+    "topic": "n1-monitor"
+  },
+  "wg_ifaces": ["wg-tunnel", "wg0-mullvad"],
+  "hosts": [
+    {"name": "gateway",     "ip": "10.0.0.20",  "group": "tunnel",    "role": "Hyperviseur / stockage (cluster)", "probe": {"type": "tcp", "port": 22},  "alert": true},
+    {"name": "monitoring",  "ip": "10.0.0.10",  "group": "tunnel",    "role": "Grafana / Prometheus",             "probe": {"type": "tcp", "port": 443}, "alert": false},
+    {"name": "vm-app",      "ip": "10.0.10.10", "group": "tunnel-vm", "role": "App (non routée depuis l'hôte)",   "probe": {"type": "tcp", "port": 22},  "alert": false},
+    {"name": "vm-db",       "ip": "10.0.20.10", "group": "tunnel-vm", "role": "Base de données",                  "probe": {"type": "tcp", "port": 22},  "alert": false},
+    {"name": "router",      "ip": "192.0.2.1",  "group": "lan",       "role": "Routeur / passerelle (LAN)",       "probe": {"type": "tcp", "port": 80},  "alert": true},
+    {"name": "server.local","ip": "192.0.2.2",  "group": "lan",       "role": "Stack applicative LAN",            "probe": {"type": "tcp", "port": 443}, "alert": true},
+    {"name": "tv",          "ip": "192.0.2.3",  "group": "lan",       "role": "Android TV (cast)",                "probe": {"type": "tcp", "port": 6466},"alert": true}
+  ]
+}

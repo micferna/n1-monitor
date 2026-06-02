@@ -1,0 +1,8 @@
+{
+  "uuid": "n1-monitor@ocb",
+  "name": "n1 monitor",
+  "description": "Panel indicator for n1 firewall / network / Mullvad state. Reads /run/n1-monitor.json maintained by the n1mon system service.",
+  "shell-version": ["46", "47", "48"],
+  "version": 1,
+  "url": "https://localhost/n1-monitor"
+}
