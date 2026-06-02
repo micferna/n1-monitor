@@ -481,6 +481,7 @@ class State:
         self.host_status: dict[str, dict] = {}
         self.infra_events: collections.deque = collections.deque(maxlen=EVENTS_MAX)
         self.infra_cache: dict = {}
+        self.updates: dict = {}  # paquets upgradables (rafraîchi par updates_prober)
         self.state_dir = resolve_state_dir()
         self.presence_path = self.state_dir / "presence.jsonl"
         self.presence_persistent = not str(self.state_dir).startswith("/run")
@@ -826,9 +827,9 @@ def collect_system(state: State) -> dict:
             load = f.read().split()[:3]
     except OSError:
         load = ["?", "?", "?"]
+    mi: dict = {}
     try:
         with open("/proc/meminfo") as f:
-            mi = {}
             for line in f:
                 k, _, rest = line.partition(":")
                 v = rest.strip().split()
@@ -849,14 +850,68 @@ def collect_system(state: State) -> dict:
             }
         except OSError:
             pass
+    try:
+        with open("/proc/uptime") as f:
+            uptime = float(f.read().split()[0])
+    except OSError:
+        uptime = 0.0
+    swap_total = mi.get("SwapTotal", 0) / 1024 / 1024
+    swap_used = max(0.0, swap_total - mi.get("SwapFree", 0) / 1024 / 1024)
     return {
         "load": load,
+        "cores": os.cpu_count() or 1,
+        "uptime": round(uptime),
         "cpu_pct": read_cpu_pct(state),
         "cpu_temp": read_cpu_temp(),
         "mem_gib": {"used": round(used, 1), "total": round(total, 1)},
+        "swap_gib": {"used": round(swap_used, 1), "total": round(swap_total, 1)},
         "disk": disk,
         "net": read_net(state),
     }
+
+
+def collect_health() -> dict:
+    """Services systemd en échec + reboot requis + sessions ouvertes."""
+    failed = []
+    for ln in run(["systemctl", "--failed", "--no-legend", "--plain"]).splitlines():
+        f = ln.split()
+        if f and f[0].endswith((".service", ".timer", ".socket", ".mount")):
+            failed.append(f[0])
+    reboot = os.path.exists("/var/run/reboot-required") or os.path.exists("/run/reboot-required")
+    users = []
+    for ln in run(["who"]).splitlines():
+        f = ln.split()
+        if len(f) < 2:
+            continue
+        remote = f[-1].strip("()") if f[-1].startswith("(") and f[-1].endswith(")") else ""
+        users.append({"user": f[0], "tty": f[1], "from": remote, "remote": bool(remote)})
+    return {
+        "failed_units": failed,
+        "reboot_required": reboot,
+        "sessions": {
+            "count": len(users),
+            "ssh": sum(1 for u in users if u["remote"]),
+            "users": users,
+        },
+    }
+
+
+def collect_updates() -> dict:
+    """Paquets upgradables (total + sécurité). Lent (apt) → thread dédié."""
+    insts = [ln for ln in run(["apt-get", "-s", "upgrade"], timeout=40).splitlines()
+             if ln.startswith("Inst ")]
+    sec = sum(1 for ln in insts if "security" in ln.lower())
+    return {"total": len(insts), "security": sec}
+
+
+def updates_prober(state: "State", stop: threading.Event) -> None:
+    """Rafraîchit l'inventaire des paquets upgradables (apt lent) hors boucle principale."""
+    while not stop.is_set():
+        try:
+            state.updates = collect_updates()
+        except Exception as e:
+            state.updates = {"error": str(e)}
+        stop.wait(1800.0)  # 30 min
 
 
 def write_atomic(path: Path, data: dict) -> None:
@@ -897,10 +952,12 @@ def main() -> int:
     threading.Thread(target=journal_tailer, args=(drops, state, stop), daemon=True).start()
     threading.Thread(target=state.rdns.worker, args=(stop,), daemon=True).start()
     threading.Thread(target=infra_prober, args=(state, stop), daemon=True).start()
+    threading.Thread(target=updates_prober, args=(state, stop), daemon=True).start()
 
     # Collectes lentes (subprocess) mémoïsées pour ne pas spammer à chaque cycle.
     mv_cache = TTL(collect_mullvad, ttl=6.0)
     fb_cache = TTL(collect_fail2ban, ttl=20.0)
+    health_cache = TTL(collect_health, ttl=12.0)
 
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     signal.signal(signal.SIGINT, lambda *_: stop.set())
@@ -915,6 +972,8 @@ def main() -> int:
                 "mullvad": mv_cache.get(),
                 "fail2ban": fb_cache.get(),
                 "system": collect_system(state),
+                "health": health_cache.get(),
+                "updates": state.updates,
                 "infra": state.infra_cache,
             }
             write_atomic(OUTPUT, data)
