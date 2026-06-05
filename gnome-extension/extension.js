@@ -50,8 +50,10 @@ class Indicator extends PanelMenu.Button {
 
         this._fwLine1 = new PopupMenu.PopupMenuItem('Firewall: …', {reactive: false});
         this._fwLine2 = new PopupMenu.PopupMenuItem('Drops 1m/5m/1h: …', {reactive: false});
+        this._fwLine3 = new PopupMenu.PopupMenuItem('Top drops: …', {reactive: false});
         this._fwSection.addMenuItem(this._fwLine1);
         this._fwSection.addMenuItem(this._fwLine2);
+        this._fwSection.addMenuItem(this._fwLine3);
 
         this._mvLine1 = new PopupMenu.PopupMenuItem('Mullvad: …', {reactive: false});
         this._mvLockdown = new PopupMenu.PopupSwitchMenuItem('Lockdown (killswitch)', false);
@@ -85,6 +87,11 @@ class Indicator extends PanelMenu.Button {
         this.menu.addMenuItem(this._sysSection);
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
         this.menu.addMenuItem(this._infraSection);
+        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+
+        // Appareils LAN découverts automatiquement (mDNS/ARP).
+        this._lanSub = new PopupMenu.PopupSubMenuMenuItem('Appareils LAN : …');
+        this.menu.addMenuItem(this._lanSub);
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
         const tui = new PopupMenu.PopupMenuItem('Ouvrir le TUI');
@@ -216,11 +223,44 @@ class Indicator extends PanelMenu.Button {
             (infraSumm.unreachable ? `  ${infraSumm.unreachable} injoign.` : '')
         );
         this._infraDownLine.label.set_text(
-            infraDownAlert.length ? `  ⚠ hors-ligne : ${infraDownAlert.map(h => h.name).join(', ')}` : ''
+            infraDownAlert.length
+                ? `  ⚠ ${infraDownAlert.map(h => `${h.name} (${h.status})`).join(', ')}`
+                : ''
         );
 
         this._fwLine1.label.set_text(`Firewall : ${fw.active ? 'ACTIVE' : 'OFF'}  conns: ${conns.count || 0}`);
         this._fwLine2.label.set_text(`Drops  1m: ${drops1m}  /  5m: ${drops5m}  /  1h: ${drops1h}`);
+
+        // Top sources droppées, NOMMÉES (au lieu des IP brutes).
+        const topDrops = (fw.top_dropped || []).slice(0, 4).map(t => {
+            const who = t.src_name || t.src || '-';
+            const dp = t.dport ? `:${t.dport}` : '';
+            return `${who}${dp} ×${t.count}`;
+        }).join('   ');
+        this._fwLine3.label.set_text(`Top drops : ${topDrops || '—'}`);
+
+        // Sous-menu appareils LAN (découverte autonome mDNS/ARP).
+        const lan = d.lan || {};
+        const devs = lan.devices || [];
+        this._lanSub.label.set_text(`Appareils LAN : ${devs.length}`);
+        this._lanSub.menu.removeAll();
+        for (const x of devs) {
+            const seen = x.reachable ? '●' : '○';
+            const name = x.name || '?';
+            const extra = x.type || x.vendor || '';
+            const it = new PopupMenu.PopupMenuItem(
+                `${seen} ${x.ip}   ${name}   ${extra}`, {reactive: false});
+            this._lanSub.menu.addMenuItem(it);
+        }
+        for (const a of (lan.alerts || []).slice(-3)) {
+            let t = '';
+            if (a.kind === 'mac-change')
+                t = `⚠ collision IP ${a.ip} : ${a.old} → ${a.new}`;
+            else if (a.kind === 'ip-change')
+                t = `ℹ ${a.name} : ${a.old} → ${a.new}`;
+            if (t)
+                this._lanSub.menu.addMenuItem(new PopupMenu.PopupMenuItem(t, {reactive: false}));
+        }
 
         this._mvLine1.label.set_text(
             `Mullvad : ${mv.connected ? 'connecté' : 'DÉCONNECTÉ'}` +

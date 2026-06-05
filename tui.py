@@ -215,13 +215,15 @@ _GROUPS = [
 ]
 _STATUS_STYLE = {
     "up": ("●", "green"),
+    "service-down": ("◐", "red"),
+    "wrong-device": ("⚠", "magenta"),
     "down": ("●", "red"),
     "unreachable": ("◌", "yellow"),
     "unknown": ("?", "dim"),
 }
 
 
-def fmt_infra(inf: dict) -> str:
+def fmt_infra(inf: dict, lan: dict | None = None) -> str:
     if not inf or not inf.get("hosts"):
         if inf.get("error"):
             return f"[red]🛰  infra : {inf['error']}[/red]"
@@ -229,10 +231,15 @@ def fmt_infra(inf: dict) -> str:
     now = time.time()
     summ = inf.get("summary", {})
     persist = "" if inf.get("persistent") else "  [dim](historique non persistant)[/dim]"
+    extra = ""
+    if summ.get("service-down"):
+        extra += f"  [red]{summ['service-down']} service-down[/red]"
+    if summ.get("wrong-device"):
+        extra += f"  [magenta]{summ['wrong-device']} usurpé[/magenta]"
     lines = [
         f"[bold]🛰  infra :[/bold] [green]{summ.get('up', 0)} up[/green]  "
         f"[red]{summ.get('down', 0)} down[/red]  "
-        f"[yellow]{summ.get('unreachable', 0)} injoignable[/yellow]  "
+        f"[yellow]{summ.get('unreachable', 0)} injoignable[/yellow]{extra}  "
         f"/ {summ.get('total', 0)}{persist}"
     ]
     wg = inf.get("wg", [])
@@ -254,12 +261,12 @@ def fmt_infra(inf: dict) -> str:
             glyph, col = _STATUS_STYLE.get(h.get("status", "unknown"), ("?", "dim"))
             age = hr_age(now - h["since"]) if h.get("since") else "?"
             rtt = f" {h['rtt_ms']}ms" if h.get("rtt_ms") is not None else ""
-            closed = " [dim](port fermé)[/dim]" if h.get("port_closed") else ""
             mute = "" if h.get("alert") else " [dim]🔕[/dim]"
+            tail = (f"[yellow]{h['detail']}[/yellow]" if h.get("detail")
+                    else f"[dim]{h.get('role', '')}[/dim]")
             lines.append(
                 f"  [{col}]{glyph}[/{col}] {h['name']:<13} [dim]{(h.get('ip') or ''):<13}[/dim] "
-                f"[{col}]{h.get('status', '?'):<11}[/{col}] {age:<6}{rtt}{closed}{mute}"
-                f"  [dim]{h.get('role', '')}[/dim]"
+                f"[{col}]{h.get('status', '?'):<12}[/{col}] {age:<6}{rtt}{mute}  {tail}"
             )
         lines.append("")
     evs = inf.get("events", [])
@@ -270,7 +277,29 @@ def fmt_infra(inf: dict) -> str:
             col = "green" if to == "up" else "red"
             arrow = "↑" if to == "up" else "↓"
             ago = hr_age(now - e["ts"]) if e.get("ts") else "?"
-            lines.append(f"  [{col}]{arrow}[/{col}] {e.get('host', ''):<13} {to or '?':<5} [dim]il y a {ago}[/dim]")
+            det = f" [dim]({e['detail']})[/dim]" if e.get("detail") else ""
+            lines.append(f"  [{col}]{arrow}[/{col}] {e.get('host', ''):<13} {to or '?':<5}{det} [dim]il y a {ago}[/dim]")
+
+    if lan and lan.get("devices"):
+        lines.append("")
+        lines.append(f"[bold cyan]Appareils LAN (découverte auto)[/bold cyan] "
+                     f"[dim]{lan.get('subnet', '')}[/dim]")
+        for d in lan["devices"]:
+            name = d.get("name") or "?"
+            seen = "●" if d.get("reachable") else "○"
+            scol = "green" if d.get("reachable") else "dim"
+            extra = d.get("type") or d.get("vendor") or ""
+            lines.append(
+                f"  [{scol}]{seen}[/{scol}] {d['ip']:<13} {name:<16} "
+                f"[dim]{d.get('mac', ''):<17}[/dim] [dim]{extra}[/dim]"
+            )
+        for a in lan.get("alerts", [])[-3:]:
+            if a.get("kind") == "mac-change":
+                lines.append(f"  [red bold]⚠ collision IP {a.get('ip')} : "
+                             f"MAC {a.get('old')} → {a.get('new')}[/red bold]")
+            elif a.get("kind") == "ip-change":
+                lines.append(f"  [yellow]ℹ {a.get('name')} a changé d'IP : "
+                             f"{a.get('old')} → {a.get('new')}[/yellow]")
     return "\n".join(lines)
 
 
@@ -349,16 +378,20 @@ class FirewallPanel(Panel):
             body += "\n[bold]top dropped (1h) :[/bold]\n"
             for t in top[:6]:
                 src = t["src"] or "-"
-                body += f"  [{t['chain'][:3]}] {t['proto']}/{str(t['dport']):<5} from {src:<16} ×{t['count']}\n"
+                nm = t.get("src_name") or ""
+                who = f"[cyan]{nm}[/cyan] [dim]{src}[/dim]" if nm else src
+                body += f"  [{t['chain'][:3]}] {t['proto']}/{str(t['dport']):<5} from {who} ×{t['count']}\n"
         recent = fw.get("recent", [])
         if recent:
             body += "\n[bold]flux live :[/bold]\n"
             for r in recent[-6:][::-1]:
                 dport = r.get("dport", "") or ""
                 sep = ":" if dport else ""
+                s_nm = r.get("src_name") or r.get("src", "?")
+                d_nm = r.get("dst_name") or r.get("dst", "?")
                 body += (
-                    f"  [dim]{(r.get('chain', '') or '')[:3]}[/dim] {r.get('src', '?')} → "
-                    f"{r.get('dst', '?')}{sep}{dport} [dim]{r.get('proto', '')}[/dim]\n"
+                    f"  [dim]{(r.get('chain', '') or '')[:3]}[/dim] {s_nm} → "
+                    f"{d_nm}{sep}{dport} [dim]{r.get('proto', '')}[/dim]\n"
                 )
         return body
 
@@ -382,7 +415,7 @@ class ConnectionsPanel(Panel):
         lines.append("[bold]échantillon :[/bold]")
         for cn in c.get("sample", [])[:12]:
             comm = cn["comm"] or "-"
-            who = cn.get("rhost") or cn.get("rip") or cn.get("remote")
+            who = cn.get("rhost") or cn.get("rname") or cn.get("rip") or cn.get("remote")
             cls = cn.get("rclass", "")
             tag = "" if cls in ("public", "") else f" [yellow]({cls})[/yellow]"
             lines.append(f"  {comm:<16} → {who}{tag}")
@@ -436,7 +469,7 @@ class InfraPanel(Panel):
     body_id = "infra_body"
 
     def render_body(self, s: dict) -> str:
-        return fmt_infra(s.get("infra", {}))
+        return fmt_infra(s.get("infra", {}), s.get("lan", {}))
 
 
 # --------------------------------------------------------------------------- #

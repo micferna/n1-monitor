@@ -1,0 +1,38 @@
+[Unit]
+Description=n1 monitor — découverte LAN (mDNS/ARP) pour identité autonome
+Documentation=https://github.com/micferna/n1-monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Script en chemin SYSTÈME (pas dans /home) : le service tourne avec CAP_NET_RAW
+# seul (sans CAP_DAC_OVERRIDE) et ne pourrait pas traverser /home (mode 700).
+# n1-setup.sh installe lan_discovery.py dans /usr/local/lib/n1-monitor/.
+ExecStart=/usr/bin/python3 /usr/local/lib/n1-monitor/lan_discovery.py --interval 30
+Restart=on-failure
+RestartSec=5
+
+# --- Privilèges minimaux : capture L2 (mDNS) + ARP, rien d'autre ---
+User=root
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_NET_RAW
+AmbientCapabilities=CAP_NET_RAW
+
+# --- Sandboxing (script hors /home → on peut masquer /home entièrement) ---
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/run
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_PACKET AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

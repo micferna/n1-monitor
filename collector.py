@@ -31,6 +31,13 @@ import urllib.request
 from pathlib import Path
 
 OUTPUT = Path("/run/n1-monitor.json")
+LAN_OUT = Path("/run/n1-monitor-lan.json")  # table d'identité LAN (lan_discovery)
+# IP multicast/broadcast bien connues, étiquetées telles quelles dans les drops.
+WELLKNOWN = {
+    "224.0.0.251": "mDNS", "224.0.0.1": "all-hosts", "224.0.0.22": "IGMP",
+    "239.255.255.250": "SSDP", "255.255.255.255": "broadcast", "0.0.0.0": "this-net",
+    "ff02::fb": "mDNS", "ff02::1": "all-nodes",
+}
 DROP_RE = re.compile(r"\[NFT-DROP-(?P<chain>IN|OUT|FWD)\]")
 KV_RE = re.compile(r"(\w+)=(\S*)")
 CHAIN_MAP = {"IN": "input", "OUT": "output", "FWD": "forward"}
@@ -73,7 +80,10 @@ class Drops:
             self.events.append(ev)
             self.total[ev["chain"]] = self.total.get(ev["chain"], 0) + 1
 
-    def snapshot(self) -> dict:
+    def snapshot(self, resolve=None) -> dict:
+        """``resolve`` : callable IP -> nom lisible (None = pas de résolution)."""
+        def nm(ip: str) -> str:
+            return resolve(ip) if (resolve and ip) else ""
         now = time.time()
         cnt = {w: {"input": 0, "output": 0, "forward": 0} for w in ("1m", "5m", "1h")}
         agg: dict = {}
@@ -98,11 +108,14 @@ class Drops:
             "drops_1h": cnt["1h"],
             "drops_total": total,
             "top_dropped": [
-                {"chain": k[0], "proto": k[1], "dport": k[2], "src": k[3], "count": v}
+                {"chain": k[0], "proto": k[1], "dport": k[2], "src": k[3],
+                 "src_name": nm(k[3]), "count": v}
                 for k, v in top
             ],
             "recent": [
-                {k: v for k, v in ev.items() if k != "raw"} for ev in recent
+                {**{k: v for k, v in ev.items() if k != "raw"},
+                 "src_name": nm(ev.get("src", "")), "dst_name": nm(ev.get("dst", ""))}
+                for ev in recent
             ],
         }
 
@@ -325,44 +338,59 @@ def ping(ip: str) -> bool:
         return False
 
 
-def probe_host(host: dict) -> dict:
-    """Sonde un hôte. connecté OU 'refused' (RST) = up ; timeout = down ;
-    EHOSTUNREACH/ENETUNREACH = unreachable (pas de route depuis n1)."""
+def probe_host(host: dict, lan_by_ip: dict | None = None, expected_mac: str = "") -> dict:
+    """Sonde un hôte (mode strict). Statuts :
+      up           : le port de service répond (connexion établie) ;
+      service-down : l'hôte est joignable (ping/RST) mais le service est muet ;
+      wrong-device : l'IP est tenue par un AUTRE appareil (MAC != attendue) ;
+      down         : l'hôte ne répond pas du tout ;
+      unreachable  : pas de route depuis n1.
+    Un appareil qui répond juste au ping ne fait donc PLUS passer un serveur
+    pour 'up' (fini les faux verts type 'le tél a pris l'IP du serveur')."""
     name = host.get("name", "?")
     ip = host.get("ip")
     pr = host.get("probe") or {}
     res = {"name": name, "status": "unknown", "rtt_ms": None, "port_closed": False}
     if not ip:
         return res
+    occ = (lan_by_ip or {}).get(ip) or {}
+    occ_mac = (occ.get("mac") or "").lower()
+    res["mac"] = occ_mac
+
     if pr.get("type") == "icmp":
         res["status"] = "up" if ping(ip) else "down"
-        return res
-    port = int(pr.get("port", 22))
-    res["port"] = port
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(PROBE_TIMEOUT)
-    t0 = time.time()
-    try:
-        s.connect((ip, port))
-        res["status"] = "up"
-        res["rtt_ms"] = round((time.time() - t0) * 1000)
-    except ConnectionRefusedError:
-        res["status"] = "up"          # l'hôte a répondu (RST) => vivant
-        res["port_closed"] = True
-        res["rtt_ms"] = round((time.time() - t0) * 1000)
-    except (socket.timeout, TimeoutError):
-        # Port filtré/muet (drop sans RST, ou mauvais port) : l'hôte peut être
-        # bien vivant. Fallback ICMP pour distinguer "machine éteinte" (down)
-        # de "machine vivante, service injoignable" (up + port_closed).
-        if ping(ip):
+    else:
+        port = int(pr.get("port", 22))
+        res["port"] = port
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(PROBE_TIMEOUT)
+        t0 = time.time()
+        try:
+            s.connect((ip, port))
             res["status"] = "up"
+            res["rtt_ms"] = round((time.time() - t0) * 1000)
+        except ConnectionRefusedError:
+            # L'hôte a répondu (RST) mais rien n'écoute sur le port de service.
+            res["status"] = "service-down"
             res["port_closed"] = True
-        else:
-            res["status"] = "down"
-    except OSError as e:
-        res["status"] = "unreachable" if e.errno in (errno.EHOSTUNREACH, errno.ENETUNREACH) else "down"
-    finally:
-        s.close()
+            res["rtt_ms"] = round((time.time() - t0) * 1000)
+        except (socket.timeout, TimeoutError):
+            # Muet sur le port : joignable au ping = service-down, sinon down.
+            res["status"] = "service-down" if ping(ip) else "down"
+            res["port_closed"] = True
+        except OSError as e:
+            res["status"] = ("unreachable"
+                             if e.errno in (errno.EHOSTUNREACH, errno.ENETUNREACH) else "down")
+        finally:
+            s.close()
+
+    # Croisement MAC : si l'IP est occupée par un appareil dont la MAC ne
+    # correspond pas à celle attendue, c'est qu'un autre appareil a pris l'IP.
+    if res["status"] != "up" and expected_mac and occ_mac and occ_mac != expected_mac.lower():
+        res["status"] = "wrong-device"
+    if res["status"] in ("service-down", "wrong-device", "down") and occ:
+        res["occupant"] = {"name": occ.get("name", ""), "mac": occ_mac,
+                           "vendor": occ.get("vendor", ""), "type": occ.get("type", "")}
     return res
 
 
@@ -420,11 +448,16 @@ def infra_prober(state: "State", stop: threading.Event) -> None:
     while not stop.is_set():
         try:
             cfg = state.load_hosts()
+            state.load_lan()
+            lan_by_ip = state.lan_by_ip()
             hosts = cfg.get("hosts", [])
             results: dict = {}
             if hosts:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(hosts))) as ex:
-                    futs = {ex.submit(probe_host, h): h.get("name", "?") for h in hosts}
+                    futs = {}
+                    for h in hosts:
+                        exp = (h.get("mac") or state.host_macs.get(h.get("name", ""), ""))
+                        futs[ex.submit(probe_host, h, lan_by_ip, exp)] = h.get("name", "?")
                     for fut, name in futs.items():
                         try:
                             r = fut.result(timeout=PROBE_TIMEOUT + 4)
@@ -433,12 +466,25 @@ def infra_prober(state: "State", stop: threading.Event) -> None:
                         results[r.get("name", name)] = r
             now = time.time()
             host_out = []
-            summary = {"up": 0, "down": 0, "unreachable": 0, "unknown": 0, "total": 0}
+            summary = {"up": 0, "service-down": 0, "wrong-device": 0,
+                       "down": 0, "unreachable": 0, "unknown": 0, "total": 0}
             for h in hosts:
                 name = h["name"]
                 r = results.get(name, {"status": "unknown", "rtt_ms": None, "port_closed": False})
                 status = r["status"]
-                state.update_presence(name, status, now, bool(h.get("alert", False)), h)
+                # Apprend la MAC légitime quand le service répond vraiment.
+                if status == "up" and r.get("mac"):
+                    state.host_macs[name] = r["mac"]
+                occ = r.get("occupant") or {}
+                if occ:  # nom cohérent avec le resolver (label curé > découverte)
+                    occ["name"] = state.resolve_name(h.get("ip", "")) or occ.get("name", "")
+                detail = ""
+                if status == "wrong-device":
+                    who = occ.get("name") or occ.get("vendor") or occ.get("mac") or "inconnu"
+                    detail = f"IP tenue par un autre appareil ({who})"
+                elif status == "service-down":
+                    detail = "hôte joignable mais service muet"
+                state.update_presence(name, status, now, bool(h.get("alert", False)), h, detail)
                 rec = state.host_status.get(name, {})
                 summary[status if status in summary else "unknown"] += 1
                 summary["total"] += 1
@@ -447,6 +493,7 @@ def infra_prober(state: "State", stop: threading.Event) -> None:
                     "role": h.get("role", ""), "status": status, "is_up": status == "up",
                     "since": rec.get("since"), "last_change": rec.get("last_change"),
                     "rtt_ms": r.get("rtt_ms"), "port_closed": r.get("port_closed", False),
+                    "mac": r.get("mac", ""), "occupant": occ, "detail": detail,
                     "alert": bool(h.get("alert", False)),
                 })
             state.infra_cache = {
@@ -474,9 +521,16 @@ class State:
         self.cursor: str | None = None
         self.rdns = RdnsCache()
         self.geo = GeoIP()
+        # Identité LAN autonome (alimentée par lan_discovery)
+        self.lan: dict = {}
+        self.lan_mtime: float | None = None
+        self.lan_alerts_seen: set[tuple] = set()
+        self.host_macs: dict[str, str] = {}  # MAC apprise quand un hôte est réellement UP
         # Infra / présence
         self.hosts_cfg: dict | None = None
         self.hosts_mtime: float | None = None
+        self.name_map: dict[str, str] = {}      # IP -> nom inventaire (hosts[])
+        self.override_map: dict[str, str] = {}  # IP -> label explicite (lan_names)
         self.ntfy = Ntfy({})
         self.host_status: dict[str, dict] = {}
         self.infra_events: collections.deque = collections.deque(maxlen=EVENTS_MAX)
@@ -500,10 +554,73 @@ class State:
                     self.hosts_cfg = json.load(f)
                 self.hosts_mtime = m
                 self.ntfy = Ntfy(self.hosts_cfg.get("ntfy", {}))
+                self._build_name_map()
             except (OSError, ValueError):
                 if self.hosts_cfg is None:
                     self.hosts_cfg = {"hosts": [], "wg_ifaces": [], "ntfy": {}}
         return self.hosts_cfg
+
+    def _build_name_map(self) -> None:
+        """Construit l'inventaire (hosts[]) et les labels explicites (lan_names)."""
+        cfg = self.hosts_cfg or {}
+        self.name_map = {h["ip"]: h["name"] for h in cfg.get("hosts", [])
+                         if h.get("ip") and h.get("name")}
+        self.override_map = {ip: name for ip, name in (cfg.get("lan_names") or {}).items()
+                             if ip and name and not ip.startswith("_")}
+
+    def load_lan(self) -> dict:
+        """Recharge /run/n1-monitor-lan.json quand son mtime change (peu coûteux)."""
+        try:
+            m = LAN_OUT.stat().st_mtime
+        except OSError:
+            return self.lan
+        if m != self.lan_mtime:
+            try:
+                with LAN_OUT.open() as f:
+                    self.lan = json.load(f)
+                self.lan_mtime = m
+            except (OSError, ValueError):
+                pass
+        return self.lan
+
+    def lan_by_ip(self) -> dict:
+        return (self.lan or {}).get("by_ip", {}) or {}
+
+    def resolve_name(self, ip: str) -> str:
+        """Nom lisible pour une IP. Ordre : multicast connu > labels curés
+        (lan_names puis inventaire hosts) > découverte LAN (mDNS/ARP) >
+        type/constructeur > reverse-DNS. Les noms curés priment sur la
+        découverte (qui sort parfois des UUID/Android_xxxx peu lisibles)."""
+        if not ip:
+            return ""
+        if ip in WELLKNOWN:
+            return WELLKNOWN[ip]
+        if ip in self.override_map:        # label manuel explicite (lan_names)
+            return self.override_map[ip]
+        if ip in self.name_map:            # nom d'inventaire (hosts[])
+            return self.name_map[ip]
+        rec = self.lan_by_ip().get(ip)
+        if rec and rec.get("name"):        # découverte autonome
+            return rec["name"]
+        if rec:
+            t = rec.get("type") or rec.get("vendor")
+            if t:
+                return t
+        h = self.rdns.get(ip)
+        if h:
+            return h.split(".")[0]
+        return ""
+
+    def new_lan_alerts(self) -> list:
+        """Alertes de découverte (collision/changement d'IP) pas encore notifiées."""
+        out = []
+        for a in (self.lan or {}).get("alerts", []):
+            sig = (a.get("kind"), a.get("ip"), a.get("old"), a.get("new"))
+            if sig in self.lan_alerts_seen:
+                continue
+            self.lan_alerts_seen.add(sig)
+            out.append(a)
+        return out
 
     def _persist_event(self, ev: dict) -> None:
         try:
@@ -513,9 +630,10 @@ class State:
             pass
 
     def update_presence(self, name: str, status: str, now: float,
-                        alertable: bool, host: dict) -> None:
+                        alertable: bool, host: dict, detail: str = "") -> None:
         """Met à jour l'état d'un hôte ; sur transition up<->down : ring +
-        journal persistant + ntfy (si alertable)."""
+        journal persistant + ntfy (si alertable). ``detail`` précise la cause
+        (service muet, mauvais appareil…)."""
         is_up = status == "up"
         rec = self.host_status.get(name)
         if rec is None:
@@ -531,14 +649,17 @@ class State:
         rec["last_change"] = now
         ev = {"ts": now, "host": name, "ip": host.get("ip"),
               "role": host.get("role", ""), "to": "up" if is_up else "down",
-              "alert": alertable}
+              "status": status, "detail": detail, "alert": alertable}
         self.infra_events.append(ev)
         self._persist_event(ev)
         if alertable:
-            verb = "de retour" if is_up else "injoignable"
+            verb = "de retour" if is_up else (detail or "injoignable")
+            body = f"{host.get('ip', '')} - {host.get('role', '')}"
+            if detail and not is_up:
+                body = f"{detail} — {body}"
             self.ntfy.send(
-                f"{name} {verb}",
-                f"{host.get('ip', '')} - {host.get('role', '')}",
+                f"{name} {verb}" if is_up else f"{name} : {verb}",
+                body,
                 tags="white_check_mark" if is_up else "rotating_light",
                 priority="default" if is_up else "high",
             )
@@ -642,6 +763,7 @@ def collect_established(state: State) -> dict:
         cls = ip_class(rip)
         public = cls == "public"
         rhost = state.rdns.get(rip) if public else ""
+        rname = state.resolve_name(rip)  # nom LAN (mDNS/inventaire) si dispo
         country = state.geo.country(rip) if public else ""
         conns.append(
             {
@@ -651,6 +773,7 @@ def collect_established(state: State) -> dict:
                 "rip": rip,
                 "rclass": cls,
                 "rhost": rhost,
+                "rname": rname,
                 "country": country,
                 "comm": comm,
                 "pid": pid,
@@ -964,9 +1087,10 @@ def main() -> int:
 
     while not stop.is_set():
         try:
+            state.load_lan()
             data = {
                 "ts": time.time(),
-                "firewall": {"active": fw_active(), **drops.snapshot()},
+                "firewall": {"active": fw_active(), **drops.snapshot(state.resolve_name)},
                 "listening": collect_listening(state),
                 "connections": collect_established(state),
                 "mullvad": mv_cache.get(),
@@ -975,8 +1099,22 @@ def main() -> int:
                 "health": health_cache.get(),
                 "updates": state.updates,
                 "infra": state.infra_cache,
+                "lan": state.lan,
             }
             write_atomic(OUTPUT, data)
+            # Alertes de découverte (collision d'IP / appareil qui change d'IP).
+            for a in state.new_lan_alerts():
+                if a.get("kind") == "mac-change":
+                    state.ntfy.send(
+                        f"Collision IP {a.get('ip')}",
+                        f"changement de MAC {a.get('old')} -> {a.get('new')}"
+                        f" ({a.get('name') or 'appareil inconnu'})",
+                        tags="rotating_light", priority="high")
+                elif a.get("kind") == "ip-change":
+                    state.ntfy.send(
+                        f"{a.get('name')} a changé d'IP",
+                        f"{a.get('old')} -> {a.get('new')}",
+                        tags="information_source", priority="default")
         except Exception as e:
             try:
                 write_atomic(OUTPUT, {"ts": time.time(), "error": str(e)})

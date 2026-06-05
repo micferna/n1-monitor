@@ -150,6 +150,26 @@ else
 fi
 
 # ============================================================
+# Phase 7b : service de découverte LAN (identité autonome mDNS/ARP)
+# ============================================================
+log "Phase 7b — service n1mon-lan-discovery"
+# Tourne en root avec CAP_NET_RAW SEUL (pas de CAP_DAC_OVERRIDE) → il ne peut
+# pas lire un script dans /home (mode 700). On l'installe en chemin système.
+install -d -m 0755 /usr/local/lib/n1-monitor
+install -m 0644 "${N1MON_DIR}/lan_discovery.py" /usr/local/lib/n1-monitor/lan_discovery.py
+ok "lan_discovery.py installé dans /usr/local/lib/n1-monitor"
+install -m 0644 "${N1MON_DIR}/systemd/n1mon-lan-discovery.service" /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable n1mon-lan-discovery.service
+systemctl restart n1mon-lan-discovery.service
+sleep 1
+if [[ -f /run/n1-monitor-lan.json ]]; then
+    ok "/run/n1-monitor-lan.json créé (découverte LAN active)"
+else
+    warn "/run/n1-monitor-lan.json absent — check 'journalctl -u n1mon-lan-discovery -n 30'"
+fi
+
+# ============================================================
 # Phase 8 : raccourci clavier Super+F → n1mon (via GSettings)
 # ============================================================
 log "Phase 8 — raccourci clavier Super+F"
