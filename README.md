@@ -17,6 +17,7 @@ Les trois composants communiquent via un unique fichier d'état : `/run/n1-monit
 |---|---|---|
 | **Collector** | daemon (root) — agrège nft drops / `ss` connexions / Mullvad / fail2ban / système / sondes infra ; **nomme les IP** (drops, connexions, sondes) | `collector.py` |
 | **LAN-discovery** | daemon (root, `CAP_NET_RAW` seul) — **identité LAN autonome** : capture mDNS L2 + ARP + OUI → `/run/n1-monitor-lan.json` | `lan_discovery.py` |
+| **Drop-logger** | daemon (root) — tail `journalctl -kf`, **historise les drops nft** (`[NFT-DROP-*]`) en JSONL **borné** → `/var/lib/n1-monitor/drops.jsonl` | `drop_logger.py` |
 | **TUI** | interface Textual (firewall, connexions, ports en écoute, Mullvad+fail2ban+sys, **Infra + appareils LAN**) | `tui.py` (lancé via `bin/n1mon`) |
 | **Extension GNOME** | indicateur en barre du haut `🛡 N 🔒 ⚠N 🚫N` + menu (drops nommés, sous-menu appareils LAN) | `gnome-extension/` |
 
@@ -25,7 +26,7 @@ Les trois composants communiquent via un unique fichier d'état : `/run/n1-monit
 ```sh
 # 1. déposer le code
 mkdir -p ~/.local/share/n1-monitor
-cp collector.py lan_discovery.py tui.py requirements.txt ~/.local/share/n1-monitor/
+cp collector.py lan_discovery.py drop_logger.py tui.py requirements.txt ~/.local/share/n1-monitor/
 cp hosts.example.json ~/.local/share/n1-monitor/hosts.json   # puis éditer avec tes vraies IP
 
 # 2. extension GNOME
@@ -98,6 +99,33 @@ port en sortie, ou ajoute-le à l'allowlist.
 extension) sur **transition** up↔down. Les transitions sont journalisées dans
 `/var/lib/n1-monitor/presence.jsonl` (persistant).
 
+## Historique persistant des drops nftables
+
+Le collector ne garde les drops qu'en RAM (fenêtre glissante) : un drop intéressant
+défile vite. Le daemon `drop-logger` (root) tail `journalctl -kf`, parse les lignes
+`[NFT-DROP-IN|OUT|FWD]` (**même parsing que le collector**), enrichit avec les noms
+LAN, et **append un JSON par drop** dans `/var/lib/n1-monitor/drops.jsonl` (mode
+`644`, donc lisible sans privilège). Reprise au curseur journal après reboot ;
+seed de la dernière heure au premier démarrage.
+
+**Taille bornée — ne peut pas remplir le disque.** Le log nft est *rate-limité à
+5/min* côté parefeu (≈ 1,5 Mo/jour au pire), et le fichier est **plafonné à 16 Mo
+avec rotation auto** (la moitié la plus ancienne est jetée). Plafond ajustable via
+`MAX_BYTES` dans `drop_logger.py`.
+
+Consultation via la CLI **`nft-drops`** (espace utilisateur, aucun root) :
+
+```sh
+nft-drops                 # 40 derniers drops
+nft-drops --public        # uniquement les IP publiques (les "wtf")
+nft-drops --chain out     # chaîne OUTPUT = killswitch / egress
+nft-drops --ip 1.2.3.4    # tout ce qui touche une IP
+nft-drops --since 2h      # filtre par âge (30m, 2h, 1d…)
+nft-drops --resolve       # ajoute le propriétaire whois des IP publiques
+nft-drops --stats         # résumé : compteurs + top IP publiques src/dst
+nft-drops --watch         # suit les nouveaux drops en direct
+```
+
 ## Schéma de `/run/n1-monitor.json`
 
 ```
@@ -132,6 +160,14 @@ clé `lan` ci-dessus.
   (bounding set réduit → pas de `CAP_DAC_OVERRIDE`), `ProtectHome=true`,
   `ProtectSystem=strict` ; son script est en chemin système (`/usr/local/lib`)
   car sans `CAP_DAC_OVERRIDE` il ne pourrait pas lire un script dans `/home` (700).
+- `drop-logger` tourne en root (lecture du journal kernel) mais **fortement
+  durci** : `CapabilityBoundingSet=` **vide** (aucune capability — il lit le
+  journal via l'UID 0, pas via une cap), `ProtectSystem=strict` +
+  `ReadWritePaths=/var/lib/n1-monitor` (seul chemin inscriptible),
+  **`ProtectHome=true`** (il n'accède jamais à `/home` : les labels `lan_names`
+  sont résolus côté `nft-drops`, en espace utilisateur), `PrivateDevices`,
+  `RestrictAddressFamilies=AF_UNIX AF_NETLINK`, `NoNewPrivileges`, `MemoryMax=128M`.
+  Code **stdlib pur** → zéro dépendance tierce dans le service privilégié.
 
 ## Touches du TUI
 
@@ -142,11 +178,13 @@ clé `lan` ci-dessus.
 ```
 collector.py              daemon de collecte (stdlib only) + résolution de noms
 lan_discovery.py          daemon découverte LAN (mDNS/ARP/OUI, stdlib only)
+drop_logger.py            daemon historique des drops nft (stdlib only)
 tui.py                    interface Textual
 hosts.example.json        gabarit d'inventaire (à copier en hosts.json)
 requirements.txt          deps du TUI (textual)
 bin/n1mon                 wrapper de lancement
-systemd/                  units collector + lan-discovery
+bin/nft-drops             CLI de consultation de l'historique des drops
+systemd/                  units collector + lan-discovery + drop-logger
 sudoers.d/                permissions ciblées (toggles)
 scripts/                  n1-setup.sh (install) + n1-fix-envs.sh (durcissement perms)
 gnome-extension/          indicateur barre du haut

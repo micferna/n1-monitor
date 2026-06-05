@@ -11,4 +11,6 @@ __pycache__/
 /run/
 n1-monitor.json
 presence.jsonl
+drops.jsonl
+drop_logger.cursor
 *.log

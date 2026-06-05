@@ -1,0 +1,40 @@
+[Unit]
+Description=n1mon drop-logger — historique persistant des drops nftables
+Documentation=https://github.com/micferna/n1-monitor
+After=systemd-journald.service nftables.service
+Wants=systemd-journald.service
+
+[Service]
+Type=simple
+# Script en chemin SYSTÈME (installé par n1-setup.sh dans /usr/local/lib).
+ExecStart=/usr/bin/python3 /usr/local/lib/n1-monitor/drop_logger.py
+Restart=always
+RestartSec=3
+
+# --- Privilèges minimaux : lit le journal kernel en root, AUCUNE capability ---
+User=root
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# --- Sandboxing : seule /var/lib/n1-monitor est inscriptible, /home masqué ---
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/n1-monitor
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+MemoryMax=128M
+
+[Install]
+WantedBy=multi-user.target

@@ -24,10 +24,10 @@ jobs:
         run: pip install ruff
 
       - name: Ruff — lint Python
-        run: ruff check collector.py tui.py
+        run: ruff check collector.py tui.py lan_discovery.py drop_logger.py bin/nft-drops
 
       - name: Byte-compile Python (pas de dépendances requises)
-        run: python -m py_compile collector.py tui.py
+        run: python -m py_compile collector.py tui.py lan_discovery.py drop_logger.py bin/nft-drops
 
       - name: ShellCheck — scripts shell
         run: shellcheck -S warning scripts/*.sh bin/n1mon

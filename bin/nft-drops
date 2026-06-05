@@ -1,0 +1,278 @@
+#!/usr/bin/env python3
+"""nft-drops : consulter l'historique des drops nftables capture par n1mon.
+
+Lit /var/lib/n1-monitor/drops.jsonl (alimente par le service n1mon-drop-logger).
+Aucun privilege requis : le fichier est lisible (mode 644).
+
+Exemples :
+  nft-drops                 # les 40 derniers drops
+  nft-drops -n 100          # les 100 derniers
+  nft-drops --public        # seulement les IP publiques (les "wtf")
+  nft-drops --chain out     # uniquement la chaine OUTPUT (killswitch/egress)
+  nft-drops --since 2h      # drops des 2 dernieres heures
+  nft-drops --ip 1.2.3.4    # tout ce qui touche cette IP
+  nft-drops --proto udp
+  nft-drops --resolve       # ajoute le proprietaire (whois) des IP publiques
+  nft-drops --stats         # resume : compteurs + top IP publiques
+  nft-drops --watch         # suit les nouveaux drops en direct
+"""
+from __future__ import annotations
+
+import argparse
+import ipaddress
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+JSONL = Path(os.environ.get("NFT_DROPS_FILE", "/var/lib/n1-monitor/drops.jsonl"))
+
+# Anti-injection terminal : retire les caractères de contrôle (C0 dont ESC 0x1b,
+# DEL, C1) de TOUTE donnée affichée. Le JSONL stocke ces octets échappés
+# () mais json.loads les déséchappe : sans ce filtre, une sortie whois ou
+# un champ piégé pourrait injecter des séquences d'échappement dans le terminal.
+_CTRL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+def clean(s) -> str:
+    return _CTRL.sub("", str(s))
+
+
+_TTY = sys.stdout.isatty()
+def c(code: str, s: str) -> str:
+    return f"\033[{code}m{s}\033[0m" if _TTY else s
+DIM, RED, YEL, GRN, CYA, BOLD = "2", "31", "33", "32", "36", "1"
+
+CHAIN_COLOR = {"input": CYA, "output": RED, "forward": YEL}
+PRIVATE_NETS = [ipaddress.ip_network(n) for n in (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8",
+    "169.254.0.0/16", "100.64.0.0/10", "224.0.0.0/4", "240.0.0.0/4",
+    "::1/128", "fc00::/7", "fe80::/10", "ff00::/8",
+)]
+
+
+def is_public(ip: str) -> bool:
+    if not ip:
+        return False
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return not any(addr in n for n in PRIVATE_NETS)
+
+
+def parse_since(spec: str) -> float:
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    spec = spec.strip().lower()
+    if spec and spec[-1] in units:
+        try:
+            return float(spec[:-1]) * units[spec[-1]]
+        except ValueError:
+            pass
+    try:
+        return float(spec)  # secondes brutes
+    except ValueError:
+        return 0.0
+
+
+def load(path: Path):
+    if not path.exists():
+        sys.exit(c(RED, f"Aucun historique : {path} absent. "
+                       "Le service n1mon-drop-logger tourne-t-il ? "
+                       "(systemctl status n1mon-drop-logger)"))
+    out = []
+    with path.open(errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except ValueError:
+                continue
+    return out
+
+
+# --- labels manuels lan_names (depuis le home du user, pas du daemon) --------
+def load_lan_names() -> dict:
+    """Etiquettes IP->nom de hosts.json. Le viewer tourne en user → lit le home
+    proprement (le daemon, lui, est sandboxe sans acces /home)."""
+    cfg = Path.home() / ".local/share/n1-monitor/hosts.json"
+    try:
+        data = json.loads(cfg.read_text())
+        return {ip: n for ip, n in (data.get("lan_names") or {}).items()
+                if ip != "_comment"}
+    except (OSError, ValueError):
+        return {}
+
+
+LAN_NAMES = load_lan_names()
+
+
+# --- enrichissement proprietaire (whois), cache en memoire ------------------
+_WHO: dict = {}
+def owner(ip: str) -> str:
+    # ip est déjà validé par ipaddress.ip_address() en amont (is_public),
+    # et whois est résolu en chemin absolu : pas d'injection ni de PATH hijack.
+    if ip in _WHO:
+        return _WHO[ip]
+    label = ""
+    exe = shutil.which("whois")
+    if not exe:
+        _WHO[ip] = ""
+        return ""
+    try:
+        r = subprocess.run([exe, ip], capture_output=True, text=True, timeout=6)
+        org = netname = country = ""
+        for ln in r.stdout.splitlines():
+            low = ln.lower()
+            val = ln.split(":", 1)[1].strip() if ":" in ln else ""
+            if not val:
+                continue
+            if (low.startswith("orgname") or low.startswith("org-name")
+                    or low.startswith("organization") or low.startswith("descr")) and not org:
+                org = val
+            elif low.startswith("netname") and not netname:
+                netname = val
+            elif low.startswith("country") and not country:
+                country = val
+        label = org or netname
+        if country:
+            label = f"{label} [{country}]" if label else country
+    except Exception:
+        label = ""
+    label = clean(label)[:80]  # sortie whois = externe non fiable → sanitize + borne
+    _WHO[ip] = label
+    return label
+
+
+def fmt_row(ev: dict, resolve: bool) -> str:
+    ts = ev.get("ts", 0)
+    when = time.strftime("%m-%d %H:%M:%S", time.localtime(ts)) if ts else "??"
+    ch = ev.get("chain", "?")
+    chs = c(CHAIN_COLOR.get(ch, "0"), f"{ch[:3].upper():3}")
+    proto = clean(ev.get("proto") or "?")[:4]
+    src, dst = clean(ev.get("src", "")), clean(ev.get("dst", ""))
+    sp, dp = clean(ev.get("sport", "")), clean(ev.get("dport", ""))
+    sn = clean(ev.get("src_name", "") or LAN_NAMES.get(ev.get("src", ""), ""))
+    dn = clean(ev.get("dst_name", "") or LAN_NAMES.get(ev.get("dst", ""), ""))
+    s = f"{src}:{sp}" if sp else src
+    d = f"{dst}:{dp}" if dp else dst
+    if sn:
+        s = f"{s} ({sn})"
+    if dn:
+        d = f"{d} ({dn})"
+    # surligne l'IP publique (la partie interessante)
+    if is_public(src):
+        s = c(BOLD, s)
+    if is_public(dst):
+        d = c(BOLD, d)
+    iface = clean(ev.get("oif") or ev.get("iif") or "")
+    line = f"{c(DIM, when)}  {chs} {proto:4} {s:>28} -> {d:<28} {c(DIM, iface)}"
+    if resolve:
+        pub = dst if is_public(dst) else (src if is_public(src) else "")
+        if pub:
+            o = owner(pub)
+            if o:
+                line += "  " + c(YEL, f"[{o}]")
+    return line
+
+
+def show_stats(rows):
+    by_chain: dict = {}
+    pub_dst: dict = {}
+    pub_src: dict = {}
+    for ev in rows:
+        by_chain[ev.get("chain", "?")] = by_chain.get(ev.get("chain", "?"), 0) + 1
+        if is_public(ev.get("dst", "")):
+            pub_dst[ev["dst"]] = pub_dst.get(ev["dst"], 0) + 1
+        if is_public(ev.get("src", "")):
+            pub_src[ev["src"]] = pub_src.get(ev["src"], 0) + 1
+    print(c(BOLD, f"Total drops dans l'historique : {len(rows)}"))
+    for ch, n in sorted(by_chain.items(), key=lambda x: -x[1]):
+        print(f"  {c(CHAIN_COLOR.get(ch, '0'), ch):>10} : {n}")
+    def top(title, d):
+        if not d:
+            return
+        print(c(BOLD, f"\n{title}"))
+        for ip, n in sorted(d.items(), key=lambda x: -x[1])[:10]:
+            print(f"  {c(BOLD, clean(ip)):>30}  x{n}")
+    top("Top IP publiques en SOURCE (entrant) :", pub_src)
+    top("Top IP publiques en DESTINATION (sortant/egress) :", pub_dst)
+
+
+def apply_filters(rows, a):
+    now = time.time()
+    out = []
+    cut = parse_since(a.since) if a.since else 0
+    for ev in rows:
+        if a.public and not (is_public(ev.get("src", "")) or is_public(ev.get("dst", ""))):
+            continue
+        if a.chain and not ev.get("chain", "").startswith(a.chain):
+            continue
+        if a.proto and ev.get("proto", "") != a.proto.lower():
+            continue
+        if a.ip and a.ip not in (ev.get("src", ""), ev.get("dst", "")):
+            continue
+        if cut and (now - ev.get("ts", 0)) > cut:
+            continue
+        out.append(ev)
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Historique des drops nftables capture par n1mon.")
+    ap.add_argument("-n", type=int, default=40, help="nombre de lignes (defaut 40)")
+    ap.add_argument("--public", action="store_true", help="seulement les IP publiques")
+    ap.add_argument("--chain", choices=["input", "in", "output", "out", "forward", "fwd"],
+                    help="filtrer par chaine")
+    ap.add_argument("--proto", help="filtrer par protocole (tcp/udp/icmp/igmp)")
+    ap.add_argument("--ip", help="filtrer sur une IP (src ou dst)")
+    ap.add_argument("--since", help="age max : 30m, 2h, 1d ...")
+    ap.add_argument("--resolve", action="store_true",
+                    help="afficher le proprietaire (whois) des IP publiques")
+    ap.add_argument("--stats", action="store_true", help="resume statistique")
+    ap.add_argument("--watch", action="store_true", help="suivre les nouveaux drops")
+    a = ap.parse_args()
+    if a.chain:
+        a.chain = {"in": "input", "out": "output", "fwd": "forward"}.get(a.chain, a.chain)
+
+    if a.watch:
+        # suit la fin du fichier, applique les filtres a la volee
+        seen = JSONL.stat().st_size if JSONL.exists() else 0
+        print(c(DIM, "watch — Ctrl-C pour quitter"))
+        try:
+            while True:
+                if JSONL.exists() and JSONL.stat().st_size > seen:
+                    with JSONL.open(errors="replace") as f:
+                        f.seek(seen)
+                        chunk = f.read()
+                        seen = f.tell()
+                    for line in chunk.splitlines():
+                        try:
+                            ev = json.loads(line)
+                        except ValueError:
+                            continue
+                        if apply_filters([ev], a):
+                            print(fmt_row(ev, a.resolve))
+                time.sleep(1)
+        except KeyboardInterrupt:
+            return
+        return
+
+    rows = apply_filters(load(JSONL), a)
+    if a.stats:
+        show_stats(rows)
+        return
+    if not rows:
+        print(c(DIM, "(aucun drop ne correspond aux filtres)"))
+        return
+    for ev in rows[-a.n:]:
+        print(fmt_row(ev, a.resolve))
+
+
+if __name__ == "__main__":
+    main()

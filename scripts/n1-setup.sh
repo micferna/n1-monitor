@@ -170,6 +170,27 @@ else
 fi
 
 # ============================================================
+# Phase 7c : historique persistant des drops nft (drop-logger + CLI nft-drops)
+# ============================================================
+log "Phase 7c — service n1mon-drop-logger + CLI nft-drops"
+# Comme lan_discovery : tourne en root (lecture du journal kernel), code en
+# chemin système. Écrit /var/lib/n1-monitor/drops.jsonl (plafonné, rotation auto).
+install -m 0644 "${N1MON_DIR}/drop_logger.py" /usr/local/lib/n1-monitor/drop_logger.py
+install -m 0644 "${N1MON_DIR}/systemd/n1mon-drop-logger.service" /etc/systemd/system/
+install -d -m 0755 /var/lib/n1-monitor
+install -m 0755 "${N1MON_DIR}/bin/nft-drops" /usr/local/bin/nft-drops
+ok "drop_logger.py + CLI nft-drops installés"
+systemctl daemon-reload
+systemctl enable n1mon-drop-logger.service
+systemctl restart n1mon-drop-logger.service
+sleep 1
+if [[ -f /var/lib/n1-monitor/drops.jsonl ]]; then
+    ok "/var/lib/n1-monitor/drops.jsonl créé (historique des drops actif)"
+else
+    warn "drops.jsonl absent — check 'journalctl -u n1mon-drop-logger -n 30'"
+fi
+
+# ============================================================
 # Phase 8 : raccourci clavier Super+F → n1mon (via GSettings)
 # ============================================================
 log "Phase 8 — raccourci clavier Super+F"
